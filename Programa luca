@@ -1,0 +1,770 @@
+"""
+Bot Telegram para Resolver Questões COC
+Você gerencia múltiplas contas de clientes via Telegram
+Usa DeepSeek (barato) ou Claude (preciso) para resolver
+
+Requisitos:
+pip install python-telegram-bot selenium openai anthropic pillow python-dotenv
+"""
+
+import os
+import asyncio
+import base64
+import json
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from openai import OpenAI
+import anthropic
+from dotenv import load_dotenv
+import time
+
+load_dotenv()
+
+# Configurações
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')  # Mais barato
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')  # Mais preciso
+YOUR_TELEGRAM_ID = int(os.getenv('YOUR_TELEGRAM_ID'))  # Só você pode usar
+
+# Cliente IA
+deepseek_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1"
+)
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Armazena sessões dos clientes
+sessions = {}
+
+class ClientSession:
+    """Sessão de um cliente"""
+    
+    def __init__(self, client_name, username, password):
+        self.client_name = client_name
+        self.username = username
+        self.password = password
+        self.driver = None
+        self.is_logged_in = False
+        self.questions_solved = 0
+        self.created_at = datetime.now()
+        
+    def setup_driver(self):
+        """Configura Chrome headless"""
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
+        self.driver = webdriver.Chrome(options=chrome_options)
+        
+    def login(self):
+        """Faz login na conta do cliente"""
+        try:
+            if not self.driver:
+                self.setup_driver()
+            
+            self.driver.get("https://jornada.coc.com.br/entrar/")
+            
+            wait = WebDriverWait(self.driver, 15)
+            
+            # Preenche login
+            username_field = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+            username_field.clear()
+            username_field.send_keys(self.username)
+            
+            password_field = self.driver.find_element(By.NAME, "password")
+            password_field.clear()
+            password_field.send_keys(self.password)
+            
+            # Clica em entrar
+            login_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+            login_button.click()
+            
+            time.sleep(4)
+            
+            # Verifica sucesso
+            if "entrar" not in self.driver.current_url.lower():
+                self.is_logged_in = True
+                return True, f"✅ Logado como {self.client_name}"
+            else:
+                return False, "❌ Login falhou - credenciais inválidas"
+                
+        except Exception as e:
+            return False, f"❌ Erro: {str(e)}"
+    
+    def get_screenshot(self):
+        """Captura tela atual"""
+        try:
+            screenshot = self.driver.get_screenshot_as_png()
+            return base64.b64encode(screenshot).decode('utf-8')
+        except:
+            return None
+    
+    def extract_question(self):
+        """Extrai texto da questão e alternativas"""
+        try:
+            question_text = ""
+            alternatives = []
+            
+            # Tenta pegar a questão
+            question_selectors = [
+                ".question-text", ".enunciado", ".pergunta",
+                "[class*='question']", "[class*='Quest']",
+                "div[class*='enunciado']", "p[class*='question']"
+            ]
+            
+            for selector in question_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    texts = [el.text.strip() for el in elements if el.text.strip()]
+                    if texts:
+                        question_text = "\n".join(texts)
+                        break
+                except:
+                    continue
+            
+            # Tenta pegar alternativas
+            alt_selectors = [
+                ".alternative", ".alternativa", ".option",
+                "[class*='alternative']", "[class*='option']",
+                "label[for*='alt']", "div[class*='Alternative']"
+            ]
+            
+            for selector in alt_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    alts = [el.text.strip() for el in elements if el.text.strip()]
+                    if alts and len(alts) >= 3:  # Pelo menos 3 alternativas
+                        alternatives = alts
+                        break
+                except:
+                    continue
+            
+            return {
+                "question": question_text,
+                "alternatives": alternatives,
+                "url": self.driver.current_url
+            }
+            
+        except Exception as e:
+            return {"question": "", "alternatives": [], "url": "", "error": str(e)}
+    
+    def select_answer(self, answer_letter):
+        """Seleciona uma alternativa"""
+        try:
+            answer_index = ord(answer_letter.upper()) - 65
+            
+            # Tenta vários tipos de seletores
+            selectors = [
+                # Por valor
+                f"input[value='{answer_letter}']",
+                f"input[value='{answer_letter.upper()}']",
+                f"input[value='{answer_letter.lower()}']",
+                
+                # Por ID
+                f"input[id*='alt{answer_letter}']",
+                f"input[id*='alternativa{answer_letter}']",
+                
+                # Por label
+                f"label[for*='alt{answer_letter}']",
+                
+                # Por índice
+                f".alternative:nth-child({answer_index + 1})",
+                f".alternativa:nth-child({answer_index + 1})",
+                f".option:nth-child({answer_index + 1})"
+            ]
+            
+            for selector in selectors:
+                try:
+                    element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    self.driver.execute_script("arguments[0].click();", element)
+                    time.sleep(1)
+                    return True, f"✅ Alternativa {answer_letter.upper()} selecionada"
+                except:
+                    continue
+            
+            return False, "⚠️ Não consegui selecionar automaticamente"
+            
+        except Exception as e:
+            return False, f"❌ Erro: {str(e)}"
+    
+    def submit_answer(self):
+        """Envia a resposta"""
+        try:
+            submit_selectors = [
+                "button[type='submit']",
+                "button[class*='submit']",
+                "button[class*='enviar']",
+                "button[class*='confirmar']",
+                "input[type='submit']",
+                "button:contains('Enviar')",
+                "button:contains('Confirmar')"
+            ]
+            
+            for selector in submit_selectors:
+                try:
+                    element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    self.driver.execute_script("arguments[0].click();", element)
+                    time.sleep(2)
+                    self.questions_solved += 1
+                    return True, f"✅ Resposta enviada! Total resolvidas: {self.questions_solved}"
+                except:
+                    continue
+            
+            return False, "⚠️ Botão enviar não encontrado"
+            
+        except Exception as e:
+            return False, f"❌ Erro: {str(e)}"
+    
+    def next_question(self):
+        """Vai para próxima questão"""
+        try:
+            next_selectors = [
+                "button[class*='next']",
+                "button[class*='proximo']",
+                "button[class*='proxima']",
+                "a[class*='next']",
+                "button:contains('Próxim')"
+            ]
+            
+            for selector in next_selectors:
+                try:
+                    element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    element.click()
+                    time.sleep(2)
+                    return True, "➡️ Próxima questão"
+                except:
+                    continue
+            
+            return False, "⚠️ Botão próxima não encontrado"
+            
+        except Exception as e:
+            return False, f"❌ Erro: {str(e)}"
+    
+    def close(self):
+        """Fecha sessão"""
+        if self.driver:
+            self.driver.quit()
+        self.is_logged_in = False
+
+
+def solve_with_deepseek(question_data, screenshot_b64):
+    """Resolve com DeepSeek (barato - $0.14 por 1M tokens)"""
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": "Você é um especialista em resolver questões educacionais. Analise a questão e indique APENAS a letra da alternativa correta (A, B, C, D ou E)."
+            },
+            {
+                "role": "user",
+                "content": f"""Questão:
+{question_data.get('question', 'Ver imagem')}
+
+Alternativas:
+{chr(10).join([f"{chr(65+i)}. {alt}" for i, alt in enumerate(question_data.get('alternatives', []))])}
+
+Responda APENAS no formato:
+RESPOSTA: [letra]
+CONFIANÇA: [0-100]%
+EXPLICAÇÃO: [1 linha]"""
+            }
+        ]
+        
+        # DeepSeek ainda não suporta imagens nativamente, então usa só texto
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=300
+        )
+        
+        return {
+            "success": True,
+            "response": response.choices[0].message.content,
+            "model": "DeepSeek",
+            "cost": "~$0.0001"
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def solve_with_claude(question_data, screenshot_b64):
+    """Resolve com Claude (mais preciso - $3 por 1M tokens)"""
+    try:
+        prompt = f"""Analise esta questão educacional com MÁXIMA ATENÇÃO e indique a resposta correta.
+
+QUESTÃO:
+{question_data.get('question', 'Ver imagem')}
+
+ALTERNATIVAS:
+{chr(10).join([f"{chr(65+i)}. {alt}" for i, alt in enumerate(question_data.get('alternatives', []))])}
+
+INSTRUÇÕES:
+1. Leia com atenção a questão E a imagem
+2. Analise cada alternativa
+3. Identifique a ÚNICA correta
+4. Seja preciso - você tem alta taxa de acerto
+
+Responda APENAS:
+RESPOSTA: [letra]
+CONFIANÇA: [0-100]%
+EXPLICAÇÃO: [breve - máximo 2 linhas]"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64
+                        }
+                    },
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+        
+        return {
+            "success": True,
+            "response": message.content[0].text,
+            "model": "Claude Sonnet 4",
+            "cost": "~$0.003"
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ==================== HANDLERS TELEGRAM ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start"""
+    user_id = update.effective_user.id
+    
+    # Só você pode usar
+    if user_id != YOUR_TELEGRAM_ID:
+        await update.message.reply_text("❌ Acesso negado. Este bot é privado.")
+        return
+    
+    text = """
+🤖 **Bot COC - Resolver Questões**
+
+Comandos disponíveis:
+
+📋 **Gerenciar Clientes:**
+/add_cliente - Adicionar novo cliente
+/listar - Ver clientes ativos
+/trocar - Trocar de cliente
+
+🎯 **Resolver Questões:**
+/resolver - Resolver questão atual
+/auto - Resolver + selecionar + enviar
+/proximo - Próxima questão
+
+📊 **Utilidades:**
+/screenshot - Ver tela atual
+/status - Status da sessão
+/sair - Encerrar sessão
+
+💡 **Dica:** Use /add_cliente para começar!
+    """
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def add_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Adiciona novo cliente"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    await update.message.reply_text(
+        "📝 **Adicionar Cliente**\n\n"
+        "Envie no formato:\n"
+        "`nome_cliente usuario senha`\n\n"
+        "Exemplo:\n"
+        "`João joao.silva senha123`",
+        parse_mode='Markdown'
+    )
+    
+    context.user_data['awaiting_client'] = True
+
+
+async def handle_add_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa dados do novo cliente"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID or not context.user_data.get('awaiting_client'):
+        return
+    
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 3:
+            await update.message.reply_text("❌ Formato inválido! Use: `nome usuario senha`", parse_mode='Markdown')
+            return
+        
+        client_name, username, password = parts
+        
+        msg = await update.message.reply_text(f"⏳ Conectando na conta de {client_name}...")
+        
+        # Cria sessão
+        session = ClientSession(client_name, username, password)
+        success, message = session.login()
+        
+        if success:
+            sessions[client_name] = session
+            context.user_data['current_client'] = client_name
+            
+            keyboard = [
+                [InlineKeyboardButton("🎯 Resolver Questão", callback_data='resolver')],
+                [InlineKeyboardButton("🤖 Modo Auto", callback_data='auto')],
+                [InlineKeyboardButton("📸 Screenshot", callback_data='screenshot')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await msg.edit_text(
+                f"✅ **Cliente adicionado: {client_name}**\n\n"
+                f"Total de questões resolvidas: 0\n"
+                f"Status: 🟢 Conectado\n\n"
+                f"Use os botões abaixo ou comandos!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        else:
+            await msg.edit_text(f"❌ {message}")
+            session.close()
+        
+        context.user_data['awaiting_client'] = False
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro: {str(e)}")
+        context.user_data['awaiting_client'] = False
+
+
+async def listar_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista clientes ativos"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    if not sessions:
+        await update.message.reply_text("📋 Nenhum cliente ativo.\n\nUse /add_cliente para adicionar.")
+        return
+    
+    text = "📋 **Clientes Ativos:**\n\n"
+    
+    for name, session in sessions.items():
+        status = "🟢" if session.is_logged_in else "🔴"
+        text += f"{status} **{name}**\n"
+        text += f"   └ Questões: {session.questions_solved}\n"
+        text += f"   └ Login: {session.username}\n\n"
+    
+    current = context.user_data.get('current_client', '')
+    if current:
+        text += f"▶️ Atual: **{current}**"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def trocar_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Troca de cliente"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    if not sessions:
+        await update.message.reply_text("❌ Nenhum cliente cadastrado.")
+        return
+    
+    keyboard = []
+    for name in sessions.keys():
+        keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"switch_{name}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "👥 **Escolha o cliente:**",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def resolver_questao(update: Update, context: ContextTypes.DEFAULT_TYPE, use_claude=False):
+    """Resolve a questão atual"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    current_client = context.user_data.get('current_client')
+    
+    if not current_client or current_client not in sessions:
+        await update.message.reply_text("❌ Nenhum cliente selecionado. Use /add_cliente")
+        return
+    
+    session = sessions[current_client]
+    
+    if not session.is_logged_in:
+        await update.message.reply_text("❌ Sessão expirada. Adicione o cliente novamente.")
+        return
+    
+    msg = await update.message.reply_text(f"🔍 Analisando questão de **{current_client}**...", parse_mode='Markdown')
+    
+    # Captura questão
+    question_data = session.extract_question()
+    screenshot = session.get_screenshot()
+    
+    if not screenshot:
+        await msg.edit_text("❌ Erro ao capturar tela")
+        return
+    
+    # Resolve com IA
+    await msg.edit_text(f"🤖 Resolvendo com {'Claude (preciso)' if use_claude else 'DeepSeek (rápido)'}...")
+    
+    if use_claude:
+        solution = solve_with_claude(question_data, screenshot)
+    else:
+        solution = solve_with_deepseek(question_data, screenshot)
+    
+    if not solution['success']:
+        await msg.edit_text(f"❌ Erro: {solution.get('error')}")
+        return
+    
+    # Extrai letra da resposta
+    response_text = solution['response']
+    answer_letter = None
+    
+    if 'RESPOSTA:' in response_text:
+        try:
+            line = [l for l in response_text.split('\n') if 'RESPOSTA:' in l][0]
+            # Pega primeira letra maiúscula após "RESPOSTA:"
+            for char in line.split('RESPOSTA:')[1]:
+                if char.upper() in 'ABCDE':
+                    answer_letter = char.upper()
+                    break
+        except:
+            pass
+    
+    # Monta resposta
+    result_text = f"🎯 **Cliente:** {current_client}\n"
+    result_text += f"🤖 **Modelo:** {solution['model']}\n"
+    result_text += f"💰 **Custo:** {solution['cost']}\n\n"
+    result_text += f"📝 **Resposta:**\n{response_text}\n"
+    
+    # Botões de ação
+    keyboard = []
+    if answer_letter:
+        keyboard.append([InlineKeyboardButton(f"✅ Selecionar {answer_letter}", callback_data=f"select_{answer_letter}")])
+        context.user_data['last_answer'] = answer_letter
+    
+    keyboard.append([InlineKeyboardButton("📤 Enviar", callback_data='submit')])
+    keyboard.append([InlineKeyboardButton("➡️ Próxima", callback_data='next')])
+    keyboard.append([InlineKeyboardButton("🔄 Tentar Claude", callback_data='retry_claude')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await msg.edit_text(result_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def auto_resolver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Modo automático: resolve + seleciona + envia"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    current_client = context.user_data.get('current_client')
+    
+    if not current_client or current_client not in sessions:
+        await update.message.reply_text("❌ Nenhum cliente selecionado")
+        return
+    
+    session = sessions[current_client]
+    
+    msg = await update.message.reply_text(f"🤖 **Modo AUTO** - {current_client}\n\n⏳ Processando...", parse_mode='Markdown')
+    
+    # 1. Captura
+    question_data = session.extract_question()
+    screenshot = session.get_screenshot()
+    
+    # 2. Resolve com Claude (mais preciso)
+    await msg.edit_text(f"🤖 **Modo AUTO**\n\n🔍 Resolvendo...")
+    solution = solve_with_claude(question_data, screenshot)
+    
+    if not solution['success']:
+        await msg.edit_text(f"❌ Erro: {solution['error']}")
+        return
+    
+    # 3. Extrai resposta
+    response_text = solution['response']
+    answer_letter = None
+    
+    if 'RESPOSTA:' in response_text:
+        try:
+            line = [l for l in response_text.split('\n') if 'RESPOSTA:' in l][0]
+            for char in line.split('RESPOSTA:')[1]:
+                if char.upper() in 'ABCDE':
+                    answer_letter = char.upper()
+                    break
+        except:
+            pass
+    
+    if not answer_letter:
+        await msg.edit_text(f"❌ Não consegui identificar a resposta:\n\n{response_text}")
+        return
+    
+    # 4. Seleciona
+    await msg.edit_text(f"🤖 **Modo AUTO**\n\n✏️ Selecionando {answer_letter}...")
+    success, message = session.select_answer(answer_letter)
+    
+    if not success:
+        await msg.edit_text(f"⚠️ {message}\n\n📝 Resposta: {answer_letter}\n{response_text}")
+        return
+    
+    # 5. Envia
+    await msg.edit_text(f"🤖 **Modo AUTO**\n\n📤 Enviando...")
+    time.sleep(1)
+    success, message = session.submit_answer()
+    
+    # Resultado final
+    result = f"✅ **QUESTÃO RESOLVIDA AUTOMATICAMENTE**\n\n"
+    result += f"👤 Cliente: {current_client}\n"
+    result += f"✏️ Resposta: {answer_letter}\n"
+    result += f"📊 Total resolvidas: {session.questions_solved}\n\n"
+    result += f"💡 {response_text}"
+    
+    keyboard = [[InlineKeyboardButton("➡️ Próxima Questão", callback_data='next')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await msg.edit_text(result, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envia screenshot da tela atual"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    current_client = context.user_data.get('current_client')
+    
+    if not current_client or current_client not in sessions:
+        await update.message.reply_text("❌ Nenhum cliente selecionado")
+        return
+    
+    session = sessions[current_client]
+    screenshot_b64 = session.get_screenshot()
+    
+    if screenshot_b64:
+        # Converte base64 para bytes
+        screenshot_bytes = base64.b64decode(screenshot_b64)
+        await update.message.reply_photo(
+            photo=screenshot_bytes,
+            caption=f"📸 Tela de {current_client}\n🌐 {session.driver.current_url}"
+        )
+    else:
+        await update.message.reply_text("❌ Erro ao capturar screenshot")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler dos botões inline"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        await query.answer("❌ Acesso negado")
+        return
+    
+    await query.answer()
+    
+    data = query.data
+    current_client = context.user_data.get('current_client')
+    
+    if data == 'resolver':
+        # Simula comando /resolver
+        await query.message.reply_text("🔍 Resolvendo...")
+        context.user_data['_temp_update'] = query
+        await resolver_questao(query, context, use_claude=False)
+        
+    elif data == 'auto':
+        await query.message.reply_text("🤖 Modo automático...")
+        await auto_resolver(query, context)
+        
+    elif data == 'screenshot':
+        await screenshot_command(query, context)
+        
+    elif data.startswith('switch_'):
+        client_name = data.replace('switch_', '')
+        context.user_data['current_client'] = client_name
+        await query.edit_message_text(f"✅ Trocado para: **{client_name}**", parse_mode='Markdown')
+        
+    elif data.startswith('select_'):
+        letter = data.replace('select_', '')
+        if current_client and current_client in sessions:
+            session = sessions[current_client]
+            success, message = session.select_answer(letter)
+            await query.answer(message)
+            await query.edit_message_text(f"{query.message.text}\n\n{message}", parse_mode='Markdown')
+    
+    elif data == 'submit':
+        if current_client and current_client in sessions:
+            session = sessions[current_client]
+            success, message = session.submit_answer()
+            await query.answer(message)
+            await query.edit_message_text(f"{query.message.text}\n\n{message}", parse_mode='Markdown')
+    
+    elif data == 'next':
+        if current_client and current_client in sessions:
+            session = sessions[current_client]
+            success, message = session.next_question()
+            await query.answer(message)
+    
+    elif data == 'retry_claude':
+        await query.message.reply_text("🔄 Tentando com Claude...")
+        await resolver_questao(query, context, use_claude=True)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra status atual"""
+    user_id = update.effective_user.id
+    
+    if user_id != YOUR_TELEGRAM_ID:
+        return
+    
+    current = context.user_data.get('current_client', 'Nenhum')
+    
+    text = f"📊 **Status**\n\n"
+    text += f"▶️ Cliente atual: **{current}**\n"
+    text += f"👥 Total clientes: {len(sessions)}\n\n"
+    
+    if current != 'Nenhum' and current in sessions:
+        session = sessions[current]
+        text += f"🎯 Questões resolvidas: {session.questions_solved}\n"
+        text += f"🌐 URL: {session.driver.current_url if session.driver else 'N/A'}\n"
+        text += f"⏰ Sessão iniciada: {session.created_at.strftime('%H:%M:%S')}"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def sair_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Encerra sessão do cliente atual"""
+    user_id = update.effective_user.id
